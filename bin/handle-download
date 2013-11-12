@@ -1,0 +1,330 @@
+#!/bin/bash
+
+. /etc/autodl/autodl.conf
+PACKAGE=handle-download
+
+DATE=$(date +"%y%m%d%H%M%S")
+
+TMP_UNZIP_LIST=/tmp/$PACKAGE.download.unziplist.$$.$DATE
+TMP_LOGFILE=/tmp/$PACKAGE.logfile.$$.$DATE
+TMP_UNZIP_DIR=$AUTODOWNLOAD_UNZIP_BASEPATH/tmp.$$.$DATE
+
+LOGFILE=$AUTODOWNLOAD_LOG_PATH/$PACKAGE.log
+
+send_mail=0
+run_library_update=0
+
+cleanup() {
+
+	echo -n "----------------- " >> "$LOGFILE"
+	date >> "$LOGFILE"
+	cat $TMP_LOGFILE >> "$LOGFILE"
+
+	rm -rf "$TMP_UNZIP_LIST" "$TMP_LOGFILE" "$TMP_UNZIP_DIR" >> $TMP_LOGFILE 2>&1
+}
+
+log() {
+	if [ "$1" == "-d" ]; then
+		echo -n $(date +"%D %H:%M:%S") >> $TMP_LOGFILE
+		echo -n " " >> $TMP_LOGFILE
+		shift
+	fi
+	echo "$@"
+	echo "$@" >> $TMP_LOGFILE
+}
+
+error() {
+	log -d "$PACKAGE Error: $1"
+	cat $TMP_LOGFILE | $MAIL_CMD -s "$PACKAGE Error: $1"
+
+	cleanup
+	exit 1
+}
+
+parse_dl_folder() {
+	local folder="$1"
+	local is_in_folder="$2"
+        local errors_in_folder=0                                                                                                                    
+	log -d "Parsing folder $folder" 
+
+	if [ $(ls "$folder" | wc -l) -gt 0 ]; then
+		for ff in "$folder"/*; do 
+			parse_dl_file "$ff" 1 || errors_in_folder=$(expr "$errors_in_folder" + 1)
+		done                                                  
+	fi
+                                                              
+	if [ $is_in_folder -gt 0 ] && [ $(ls "$folder" | wc -l) -eq 0 ]; then
+		log -d -n "Folder $folder is empty. Removing..."
+		if ! rmdir "$folder"; then
+			log "Failed!"
+			errors_in_folder=$(expr "$errors_in_folder" + 1)
+		else
+			log "Done."
+		fi
+	fi
+
+        return "$errors_in_folder"   
+}
+
+parse_dl_file() {
+
+	local dlfile="$1"
+	local is_in_folder="$2"
+	local dlname=$(basename "$dlfile")
+	local dlext=$(echo "$dlname" | awk -F . '{print $NF}')
+	local dlpath=$(dirname "$dlfile")
+	
+	
+	
+	log -d -n "Parsing file $dlfile ... "
+	
+	if ! [ -e "$dlfile" ]; then
+		log "Failed! File $dlfile does not exist."
+		return 1;
+	fi
+		
+	if [ -d "$dlfile" ]; then
+		log "Done. File is a folder. Scanning contents."
+	
+		parse_dl_folder "$dlfile" $is_in_folder
+		echo "$actions"| $MAIL_CMD -s "$PACKAGE $dlfile folder finished"
+		return $?
+	fi
+	
+	if [ "$dlext" == "zip" ] || [ "$dlext" == "rar" ]; then
+		log "Done. File is a zipped archive. Parsing archive contents..."
+		parse_archive "$dlfile"
+		rm -rf "$TMP_UNZIP_DIR"
+		echo "$actions"| $MAIL_CMD -s "$PACKAGE $dlfile archive finished"
+		return $?
+	fi
+	
+	log "Done. Searching for rename/move/copy rules."
+
+	local send_mail=1
+	local go_on=1
+
+	local newname=$(echo "$dlname" | $PHP_CMD $REGEXPTOOL_SCRIPT -c $REGEXPTOOL_CONFIG_RENAME)
+	local copypath=$(echo "$newname" | $PHP_CMD $REGEXPTOOL_SCRIPT -c $REGEXPTOOL_CONFIG_COPY)
+	local movepath=$(echo "$newname" | $PHP_CMD $REGEXPTOOL_SCRIPT -c $REGEXPTOOL_CONFIG_MOVE)
+	local newfile="$dlpath/$newname"
+
+	local actions="$dlname will be:"
+	[ "$dlname" != "$newname" ] && actions="$actions
+    Renamed to $newname"
+	[ -z "$copypath" ] || actions="$actions
+    Copied to $copypath"
+	[ -z "$movepath" ] || actions="$actions
+    Moved to $movepath"
+
+	log -d "$actions"
+
+	if [ "$dlname" != "$newname" ]; then
+		
+		log -d -n "Renaming $dlname to $newname ... "
+		
+		if [ -e  "$newfile" ]; then
+			log "Failed! Target file already exists. Cannot rename."
+			go_on=0
+		else 
+			if mv "$dlfile" "$newfile" >> $TMP_LOGFILE 2>&1; then
+				log "Done."
+			else
+				log "Failed. Error while renaming."
+				go_on=0
+			fi
+		fi
+	fi
+	
+	if ! [ -z "$copypath" ] && [ $go_on -eq 1 ]; then
+		log -d -n "Copying $newname to $copypath ... "
+
+		if ! [ -d "$copypath" ]; then
+			log "Failed! Target folder doesn't exist."
+			parentpath=$(dirname "$copypath")
+			log -d -n "Trying to create folder indise $parentpath... "
+			if ! [ -d "$parentpath" ]; then
+				log "Failed! Nor target folder neither parent folder exist."
+				go_on=0
+			else
+				if ! mkdir "$copypath"; then
+					log "Failed! Nor target folder neither parent folder exist."
+					go_on=0
+				fi
+			fi
+		fi
+
+		if [ -d "$copypath" ]; then
+			copyfile="$copypath/$newname"
+			if [ -e "$copyfile" ]; then
+				log "Failed! Target file already exists."
+				go_on=0
+			else
+				if cp -p "$newfile" "$copypath" >> $TMP_LOGFILE 2>&1; then
+					log "Done."
+				else
+					log "Failed. Error while copying."
+					go_on=0
+				fi
+			fi
+		fi
+	fi
+
+	if ! [ -z "$movepath" ] && [ $go_on -eq 1 ]; then
+		log -d -n "Moving $newfile to $movepath ... "
+
+		if ! [ -d "$movepath" ]; then
+			log "Failed! Target folder doesn't exist."
+			parentpath=$(dirname "$movepath")
+			log -d -n "Trying to create folder indise $parentpath... "
+			if ! [ -d "$parentpath" ]; then
+				log "Failed! Nor target folder neither parent folder exist."
+				go_on=0
+			else
+				if ! mkdir "$movepath"; then
+					log "Failed! Nor target folder neither parent folder exist."
+					go_on=0
+				fi
+			fi
+		fi
+
+		if ! [ -d "$movepath" ]; then
+			log "Failed! Target folder does not exist."
+			go_on=0
+		else
+			movefile="$movepath/$newname"
+			if [ -e "$movefile" ]; then
+				log "Failed! Target file already exists."
+				go_on=0
+			else
+
+				if mv "$newfile" "$movepath" >> $TMP_LOGFILE 2>&1; then
+					log "Done."
+					run_library_update=1
+				else
+					log "Failed. Errore while moving."
+					go_on=0
+				fi
+			fi
+		fi
+	fi
+	
+	if [ $go_on -eq 1 ]; then
+		echo "$actions"| $MAIL_CMD -s "$PACKAGE $dlfile finished"
+		return 0;
+	else
+		return 1;
+	fi
+}
+
+parse_archive() {
+	local file=$1
+	local zippath=$(dirname "$file")
+	local ext=$(echo "$file" | awk -F . '{print $NF}')
+
+	touch $TMP_UNZIP_LIST
+
+	local zip_content=""
+	if [ "$ext" == "rar" ]; then
+		log -d -n "Extracting RAR file list... "
+		zip_content=$($UNRAR_CMD vb "$file")
+		log "Done."
+	elif [ "$ext" == "zip" ]; then
+		log -d -n "Extracting ZIP file list... "
+		zip_content=$($UNZIP_CMD -l -qq "$file" | cut -c 31-)
+		log "Done."
+	fi
+
+	oldIFS=$IFS
+	IFS=$'\n'
+	for f in $zip_content; do
+		IFS=$oldIFS
+		log -d -n "Evaulating in-zip file $f ... "
+		e=$(echo "$f" | awk -F . '{print $NF}')
+		
+		case "$e" in
+			avi|mpg|mpeg|mkv|mp4|srt) 
+				log "It's a movie!"
+				echo "$f" >> $TMP_UNZIP_LIST
+				;;
+			zip|rar|r[0-9][0-9])
+				log "OMG... Nested archives!"
+				echo "$f" >> $TMP_UNZIP_LIST
+				;;
+			*)
+				log "Not interesting"
+				;;
+		esac
+	done
+	IFS=$oldIFS
+	
+	oldIFS=$IFS
+	IFS=$'\n'
+	for f in $(cat $TMP_UNZIP_LIST); do
+		IFS=$oldIFS
+		log -d -n "Extracting file $f ... "
+		if [ "$ext" == "rar" ]; then
+			if ! $UNRAR_CMD x -p- -o- "$file" "$f" "$TMP_UNZIP_DIR/" >> $TMP_LOGFILE 2>&1; then
+				log "Failed!"
+				rm "$TMP_UNZIP_LIST"
+				return 1
+			else
+				log "Done."
+			fi
+		else 
+			if ! $UNZIP_CMD "$file" "$f" -d "$TMP_UNZIP_DIR/" >> $TMP_LOGFILE 2>&1; then
+				log "Failed!"
+				rm "$TMP_UNZIP_LIST"
+				return 1
+			else
+				log "Done."
+			fi
+		fi
+	done
+	IFS=$oldIFS
+	
+	# Ri-parso più tardi perchè per i rar multi-file mi serve che tutto sia stato estratto...
+	
+	oldIFS=$IFS
+	IFS=$'\n'
+	local list=$(cat $TMP_UNZIP_LIST)
+	rm $TMP_UNZIP_LIST
+	for f in $list; do
+		IFS=$oldIFS
+		b=$(basename "$f")
+		e=$(echo "$f" | awk -F . '{print $NF}')
+		case "$e" in
+			avi|mpg|mpeg|mkv|mp4|srt) 
+
+				parse_dl_file "$TMP_UNZIP_DIR/$f" 1
+				[ $? -gt 0 ] && return $?
+
+				;;
+			zip|rar)
+				log -d "Parsing sub-archive $f"
+				parse_archive "$TMP_UNZIP_DIR/$f"
+				if [ $? -gt 0 ]; then
+					return $?
+				fi
+				;;
+			*)
+				log "Part of a multipart archive, skipping."
+				;;
+		esac
+	done
+	IFS=$oldIFS
+	return 0
+	
+}
+
+while [ $# -gt 0 ]; do
+	dlfile="$1"
+	parse_dl_file "$dlfile" 0 || error "Error while handling finished download"
+	shift
+done
+
+if [ "$run_library_update" -gt 0 ] && ! [ -z "$LIBRARY_UPDATE_CMD" ]; then
+	eval $LIBRARY_UPDATE_CMD
+fi
+
+cleanup
