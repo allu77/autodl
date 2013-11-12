@@ -1,0 +1,128 @@
+#!/bin/bash
+. /etc/autodl/autodl.conf
+PACKAGE=handle-finished-transmission
+
+DATE=$(date +"%y%m%d%H%M%S")
+
+TMP_TRANSMISSION_OUTPUT=/tmp/$PACKAGE.transmissionoutput.$$.$DATE
+
+TMP_LOGFILE=/tmp/$PACKAGE.logfile.$$.$DATE
+TMP_CRONTAB=/tmp/$PACKAGE.crontab.$DATE
+
+LOGFILE=$AUTODOWNLOAD_LOG_PATH/$PACKAGE.log
+
+cleanup() {
+
+	echo -n "----------------- " >> "$LOGFILE"
+	date >> "$LOGFILE"
+	cat $TMP_LOGFILE >> "$LOGFILE"
+
+	rm "$TMP_TRANSMISSION_OUTPUT" "$TMP_LOGFILE" "$TMP_CRONTAB" >> $LOGFILE 2>&1
+}
+
+log() {
+	if [ "$1" == "-d" ]; then
+		echo -n $(date +"%D %H:%M:%S") >> $TMP_LOGFILE
+		echo -n " " >> $TMP_LOGFILE
+		shift
+	fi
+	echo $@
+	echo $@ >> $TMP_LOGFILE
+}
+
+error() {
+	log -d "$PACKAGE Error: $1"
+	echo "
+	
+	$PACKAGE Error: $1
+	
+	$(cat $TMP_LOGFILE)
+	
+	"| $MAIL_CMD -s "$PACKAGE ERROR"
+
+	cleanup
+	exit 1
+}
+
+
+log -d -n "Checking running transmission-daemon processes... "
+transmissionproc=$(ps -ef | grep transmission-daemon | grep -v grep | wc -l)
+
+if [ $transmissionproc -eq 0 ]; then
+	log "No process running."
+else 
+	log "Found $transmissionproc processes running"
+
+	log -d -n "Fetching download queue from transmission... "
+
+	if ! $TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --list | grep -v Sum: | tail -n +2  > $TMP_TRANSMISSION_OUTPUT 2>&1; then
+		log "Failed!"
+		error "Couldn't get transmission download list" 
+	fi
+	log "Done."
+	
+	log -d "Got the following output"
+	log "$(cat $TMP_TRANSMISSION_OUTPUT)"
+	
+	tor_total=$(cat $TMP_TRANSMISSION_OUTPUT | wc -l)
+	tor_finished=$(cat $TMP_TRANSMISSION_OUTPUT | grep " Finished " | grep " Done " | wc -l)
+	
+	if [ $tor_finished -gt 0 ]; then
+		log -d "Checking finished torrents..."
+		oldIFS=$IFS
+		IFS=$'\n'
+		for torid in $(cat $TMP_TRANSMISSION_OUTPUT | grep " Finished " | grep " Done " | awk '{print $1}'); do
+			IFS=$oldIFS
+			log -d -n "Checking torrent $torid..."
+			filename=$($TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --torrent $torid --info | grep Name: | head -n 1 | cut -c 9- -)
+			filepath="$DOWNLOAD_PATH/$filename"
+			if [ -z "$filename" ]; then
+				log "Failed! Couldn't fetch finished torrent name."
+			else
+				log "Done."
+				log -d -n "Removing torring id $torid..."
+				if $TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --torrent $torid --remove >> $TMP_LOGFILE 2>&1; then
+					log "Done."
+					log -d -n "Handling file $filepath..."
+					echo  $AUTODOWNLOAD_PATH/handle-download "$filepath"
+					if $AUTODOWNLOAD_PATH/handle-download "$filepath" >> $TMP_LOGFILE 2>&1; then
+						log "Done."
+					else
+						log "Failed!"
+						error "Error while handling finished torrent" 
+					fi
+				else
+					log "Failed!"
+					error "Error while removing finished torrent" 
+				fi
+			fi
+		done
+		IFS=$oldIFS
+	fi
+
+	if [ "$tor_total" -gt "$tor_finished" ]; then
+		log -d "Some torrent is still running/seeding. Let's monitor it as transmission won't call us again when finished seeding"
+		if ! crontab -l | grep "$AUTODOWNLOAD_HANDLE_TRANSMISSION_CMD" >/dev/null 2>&1; then
+			log -d -n "$PACKAGE is not in crontab, adding it... "
+			crontab -l > $TMP_CRONTAB
+			echo "$CRONTAB_HANDLE_TRANSMISSION" >> $TMP_CRONTAB
+			crontab $TMP_CRONTAB
+			log "Done.";
+
+		else
+			log "$PACKAGE already in crontab."
+		fi
+	else
+		log -d "No more torrent running/seeding. Let's remove $PACKAGE from crontab"
+		if crontab -l | grep "$AUTODOWNLOAD_HANDLE_TRANSMISSION_CMD" >/dev/null 2>&1; then
+			log -d -n "$PACKAGE is in crontab, removing it... "
+			crontab -l | grep -v "$AUTODOWNLOAD_HANDLE_TRANSMISSION_CMD"> $TMP_CRONTAB
+			crontab $TMP_CRONTAB
+			log "Done.";
+		else
+			log "$PACKAGE not in crontab"
+		fi
+	fi
+fi
+
+cleanup
