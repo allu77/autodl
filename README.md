@@ -24,6 +24,25 @@ You can have aMule running this script for completed files by adding the followi
 
     [UserEvents/DownloadCompleted]
     CoreEnabled=1
-    CoreCommand=/usr/local/share/autodl/handle-download "%FILE"
+    CoreCommand=/path/to/autodl/bin/handle-download "%FILE"
     GUIEnabled=0
     GUICommand=
+
+## handle-finished-transmission ##
+
+`handle-finished-transmission`
+
+As of release 2.52, you can configure Transmission to execute a script when a download is complete. However, the
+script is executed as soon as the download is finished and doesn't take into account the fact that you configured
+a seeding ratio in order to keep seeding the file for some time. This script will look for **really** finished
+downloads in the `trasmission-remote`. For every finished download found, the torrent will be removed from Transmission
+and then `handle-download` is executed for the downloaded file(s). If the scripts finds any seeding torrent, no 
+action will be taken on that torrent, but the script will re-schedule its execution in 10 minutes, in order to wait for 
+seeding to finish. Once there will be no more seeding torrents, the script won't re-schedule anymore.
+
+This script is not meant to be used via CLI, although it will work anyway. You can configure Transmission to execute
+the script when downloads are finished by editing the two following parameters in `/etc/transmission/settings.json`
+
+    "script-torrent-done-enabled": true, 
+    "script-torrent-done-filename": "/path/to/autodl/bin/handle-finished-transmission", 
+    
