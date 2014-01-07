@@ -1,0 +1,696 @@
+#!/bin/bash
+
+. /etc/autodl/autodl.conf
+
+PACKAGE=monitor-download
+LOGFILE=$AUTODOWNLOAD_LOG_PATH/$PACKAGE.log
+
+DATE=$(date +"%y%m%d%H%M%S")
+TMP_AMULEOUTPUT=/tmp/$PACKAGE.amuleoutput.$$.$DATE
+TMP_AMULEDLLIST=/tmp/$PACKAGE.amuledllist.$$.$DATE
+TMP_AMULESCRIPT=/tmp/$PACKAGE.amulescript.$$.$DATE
+TMP_JOBSOUTPUT=/tmp/$PACKAGE.jobsoutput.$$.$DATE
+TMP_TRANSMISSION_OUTPUT=/tmp/$PACKAGE.transmissionoutput.$$.$DATE
+TMP_CRONTAB=/tmp/$PACKAGE.crontab.$$.$DATE
+TMP_LOGFILE=/tmp/$PACKAGE.logfile.$$.$DATE
+
+
+cleanup() {
+
+	echo -n "----------------- " >> "$LOGFILE"
+	date >> "$LOGFILE"
+	cat $TMP_LOGFILE >> "$LOGFILE"
+
+	rm "$TMP_AMULEOUTPUT" "$TMP_AMULEDLLIST" "$TMP_AMULESCRIPT" "$TMP_TRANSMISSION_OUTPUT" "$TMP_LOGFILE" "$TMP_CRONTAB" "$TMP_JOBSOUTPUT" >> $LOGFILE 2>&1
+	$AUTODOWNLOAD_LOCK_CMD -u $AUTODOWNLOAD_LOCKFILE
+}
+
+log() {
+	if [ "$1" == "-d" ]; then
+		echo -n $(date +"%D %H:%M:%S") >> $TMP_LOGFILE
+		echo -n " " >> $TMP_LOGFILE
+		shift
+	fi
+	echo $@
+	echo $@ >> $TMP_LOGFILE
+}
+
+error() {
+	log -d "$PACKAGE Error: $1"
+	echo "
+	
+	$PACKAGE Error: $1
+	
+	$(cat $TMP_LOGFILE)
+	
+	"| $MAIL_CMD -s "$PACKAGE ERROR"
+
+	cleanup
+	exit 1
+}
+
+restart_amule() {
+	restart_reason=$1
+	send_email=$2
+	log -d -n "Restarting amule (reason $restart_reason)... "
+	if ! $AMULE_DAEMON start >> $TMP_LOGFILE 2>&1; then
+		log "Failed!"
+		error "Couldn't restart amule ($restart_reason)"
+	else
+		log "Done."
+		log -d -n "Waining some seconds for amule to complete boot... "
+		sleep 30
+		log "Done."
+		rm $AMULE_SHUTDOWN_REASON_FILE >/dev/null 2>&1
+		if [ "$send_email" -gt 0 ]; then
+			echo "
+			Amule was restarted due to $restart_reason
+			$(cat $TMP_LOGFILE)
+			"| $MAIL_CMD -s "$PACKAGE Warning"
+		fi
+	fi
+	return 0
+}
+
+check_amule() {
+	# - Conteggio download attivi adu ed eventuale pausa se sopra soglia (impostare autostart paused da amule.conf)
+
+	log -d -n "Checking running amuled processes... "
+	amuledproc=$(ps -ef | grep amuled | grep -v grep | wc -l)
+
+	if [ $amuledproc -gt 0 ]; then
+		log "Found $amuledproc processes running."
+		if [ "$sleep_time" -gt 0 ] || [ "$available_slots" -le 0 ] ; then
+			log -d -n "Shutting down amule... "
+			if ! $AMULE_DAEMON stop >> $TMP_LOGFILE 2>&1; then
+				log "Failed!"
+				error "Couldn't stop amule" 
+			else 
+				log "Done."
+				if [ "$sleep_time" -gt 0 ]; then
+					echo -n "sleep_time" > $AMULE_SHUTDOWN_REASON_FILE
+					echo "Amule was stopped because it is time to sleep" | $MAIL_CMD -s "$PACKAGE Amule Stopped."
+				elif [ "$available_slots" -le 0 ] ; then
+					echo -n "no_slots" > $AMULE_SHUTDOWN_REASON_FILE
+					echo "Amule was stopped because no slots were available" | $MAIL_CMD -s "$PACKAGE Amule Stopped."
+				else
+					echo -n "unknown" > $AMULE_SHUTDOWN_REASON_FILE
+					echo "Amule was stopped for an unknown reason" | $MAIL_CMD -s "$PACKAGE Amule Stopped."
+				fi
+			fi
+		fi
+	else
+		log -d -n "No process running... "
+		
+		if [ "$sleep_time" -gt 0 ]; then 
+			log "Correct as it is sleep time."
+		elif [ "$available_slots" -le 0 ]; then
+			log "Correct as no slots are available."
+		else
+			restart_reason=""
+			
+			if ! [ -e $AMULE_SHUTDOWN_REASON_FILE ]; then
+				log "Due to unclean shutdown, restarting."
+				restart_amule "unclean_shutdown" 1
+			else
+				restart_reason=$(cat "$AMULE_SHUTDOWN_REASON_FILE")
+				if ! [ "$restart_reason" == "finished" ]; then
+					restart_amule "$restart_reason" 1
+				fi
+			fi
+		fi
+	fi
+
+	amuledproc=$(ps -ef | grep amuled | grep -v grep | wc -l)
+	if [ $amuledproc -gt 0 ]; then
+		log -d -n "Fetching download queue from amule... "
+
+		$AMULE_CMD -p $AMULE_PORT -P $AMULE_PASSWORD -c "show dl" > $TMP_AMULEOUTPUT 2>&1 &
+		
+		cmd_res=0
+		for i in $(seq 1 $AUTODOWNLOAD_AMULECMD_WAITSTEP $AUTODOWNLOAD_AMULECMD_TIMEOUT); do
+			jobs > $TMP_JOBSOUTPUT
+			if [ $(grep -v Done $TMP_JOBSOUTPUT | grep -v Terminated | wc -l) -eq 0 ]; then	
+				cmd_res=1
+				break
+			fi
+			sleep $AUTODOWNLOAD_AMULECMD_WAITSTEP
+		done
+		
+		if [ $cmd_res -eq 0 ]; then
+			kill -9 %1 >/dev/null 2>&1
+			log "Failed! No response in $AUTODOWNLOAD_AMULECMD_TIMEOUT seconds"
+			
+			timeouts=1
+			if [ -e "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" ]; then
+				timeouts=$(expr $(cat "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER") + 1)
+			fi
+			
+			if [ $timeouts -gt $AUTODOWNLOAD_AMULECMD_TIMEOUT_RESTART ] ; then
+				log -d -n "$timeouts consecutive timeouts, trying to restart amule"
+				if ! $AMULE_DAEMON stop >> $TMP_LOGFILE 2>&1; then
+					log "Failed!"
+					echo -n $timeouts > "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER"
+					error "Couldn't stop amule"
+				else
+					log " "
+					restart_amule "Too many consecutive timeouts" 1
+					rm "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" > /dev/null 2>&1
+					error "Too many consecutive timeouts"
+				fi
+			else
+				echo -n $timeouts > "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER"
+			fi
+		
+			#error "Command timeout on amulecmd"
+			cleanup
+			exit 1
+		fi
+		
+		
+		log -d "Got the following output"
+		log "$(cat $TMP_AMULEOUTPUT)"
+		
+		if grep -i "connection failed" $TMP_AMULEOUTPUT > /dev/null 2>&1; then
+		
+			timeouts=1
+			log -d "Checking file $AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER"
+			if [ -e "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" ]; then
+				log -d "File exists"
+				timeouts=$(expr $(cat "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER") + 1)
+			fi
+			
+			if [ $timeouts -gt $AUTODOWNLOAD_AMULECMD_TIMEOUT_RESTART ] ; then
+				log -d -n "$timeouts consecutive timeouts, trying to restart amule"
+				if ! $AMULE_DAEMON stop >> $TMP_LOGFILE 2>&1; then
+					log "Failed!"
+					echo -n $timeouts > "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER"
+					error "Couldn't stop amule"
+				else
+					log " "
+					restart_amule "Too many consecutive timeouts" 1
+					rm "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" > /dev/null 2>&1
+					error "Too many consecutive timeouts"
+				fi
+			else
+				echo -n $timeouts > "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER"
+			fi
+		
+			#error "Command timeout on amulecmd"
+			cleanup
+			exit 1
+		
+		fi
+		
+		log "Done."
+		rm "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" > /dev/null 2>&1
+
+		cat $TMP_AMULEOUTPUT | awk '
+			printNext==1 { printf "%s %s %s\n", substr($2,2,length($2)-3), lastHash, $0; printNext=0}
+			/^ > [A-Za-z0-9]+ / { lastHash=$2; printNext=1 }
+		' | sort -nr | cut -d " " -f 2-1000 > $TMP_AMULEDLLIST
+
+		log -d "Parsing the following list"
+		log "$(cat $TMP_AMULEDLLIST)"
+
+		
+		amule_downloading=$(cat $TMP_AMULEDLLIST | grep "\- Downloading \-" | wc -l)
+		amule_waiting=$(cat $TMP_AMULEDLLIST | grep "\- Waiting \-" | wc -l)
+		amule_paused=$(cat $TMP_AMULEDLLIST | grep "\- Paused \-" | wc -l)
+		amule_hashing=$(cat $TMP_AMULEDLLIST | grep "\- Hashing \-" | wc -l)
+		amule_completing=$(cat $TMP_AMULEDLLIST | grep "\- Completing \-" | wc -l)
+		amule_unknown=$(cat $TMP_AMULEDLLIST | grep "\- " | grep " \-" | grep -v "\- Downloading \-" | grep -v "\- Waiting \-" | grep -v "\- Paused \-" | grep -v "\- Hashing \-" | grep -v "\- Completing \-" | wc -l)
+		
+		log -d "amule status: downloading $amule_downloading, hashing $amule_hashing, waiting $amule_waiting, paused $amule_paused, completing $amule_completing, unknown $amule_unknown"
+		
+		if [ "$amule_unknown" -gt 0 ]; then
+			echo "
+				Found some amule download in unknown status
+				
+				$(cat $TMP_AMULEDLLIST)
+				
+			"| $MAIL_CMD -s "$PACKAGE Warning"
+		fi
+		
+		total_download=$(expr $amule_downloading + $amule_waiting + $amule_hashing + $amule_completing)
+		available_slots=$(expr $available_slots - $total_download)
+
+		if [ "$PAUSE_WHILE_COMPLETING" -gt 0 ] && [ "$amule_completing" -gt 0 ] && [ "$available_slots" -ge 0 ]; then
+			available_slots=$(expr 1 - $amule_downloading - $amule_waiting - $amule_hashing - $amule_completing)
+			log -d "Some file is completing. Must stop everything but this. Avaliable slots set to $available_slots"
+		fi
+
+		touch $TMP_AMULESCRIPT
+
+		if [ $available_slots -lt 0 ]; then
+			log -d "Too many files in download. Trying to stop the waiting ones..."
+			for prio in Low Normal Auto High; do
+				log -d "Searching for priority $prio"
+				for hash in $(cat $TMP_AMULEDLLIST | grep "\- Waiting \-" | grep "\- $prio" | awk '{print $1}'); do
+					echo "Pause $hash" >> $TMP_AMULESCRIPT
+					available_slots=$(expr $available_slots + 1)
+					amule_waiting=$(expr $amule_waiting - 1)
+					if [ $available_slots -eq 0 ]; then
+						break
+					fi
+				done
+				if [ $available_slots -eq 0 ]; then
+					break
+				fi
+			done
+		fi
+
+		if [ $available_slots -lt 0 ]; then
+			log -d "Too many files in download. Trying to stop the active ones..."
+			for prio in Low Normal Auto High; do
+				log -d "Searching for priority $prio"
+				for hash in $(cat $TMP_AMULEDLLIST | grep "\- Downloading \-" | grep "\- $prio" | awk '{print $1}'); do
+					echo "Pause $hash" >> $TMP_AMULESCRIPT
+					available_slots=$(expr $available_slots + 1)
+					amule_downloading=$(expr $amule_downloading + 1)
+					if [ $available_slots -eq 0 ]; then
+						break
+					fi
+				done
+				if [ $available_slots -eq 0 ]; then
+					break
+				fi
+			done
+		fi
+		
+		if [ $available_slots -lt 0 ]; then
+			log -d "Too many files in download. Trying to stop the hashing ones..."
+			for hash in $(cat $TMP_AMULEDLLIST | grep "\- Hashing \-" | awk '{print $1}'); do
+				echo "Pause $hash" >> $TMP_AMULESCRIPT
+				available_slots=$(expr $available_slots + 1)
+				if [ $available_slots -eq 0 ]; then
+					break
+				fi
+			done
+		fi
+
+		if [ $available_slots -lt 0 ]; then
+			log -d "Too many files in download. Trying to stop the completing ones..."
+			for hash in $(cat $TMP_AMULEDLLIST | grep "\- Completing \-" | awk '{print $1}'); do
+				echo "Pause $hash" >> $TMP_AMULESCRIPT
+				available_slots=$(expr $available_slots + 1)
+				if [ $available_slots -eq 0 ]; then
+					break
+				fi
+			done
+		fi
+		
+		if [ $available_slots -gt 0 ]; then
+			log -d "Slots available. Trying to start the paused ones..."
+			for prio in High Auto Normal Low; do
+				log -d "Searching for priority $prio"
+				for hash in $(cat $TMP_AMULEDLLIST | grep "\- Paused \-" | grep "\- $prio" | awk '{print $1}'); do
+					echo "Resume $hash" >> $TMP_AMULESCRIPT
+					available_slots=$(expr $available_slots - 1)
+					if [ $available_slots -eq 0 ]; then
+						break
+					fi
+				done
+				if [ $available_slots -eq 0 ]; then
+					break
+				fi
+			done
+			
+		elif [ $available_slots -eq 0 ] && [ $amule_waiting -gt 0 ] && [ $amule_paused -gt 0 ]; then
+			log -d "Looking for preemptive downloads..."
+			
+			found_low=-1
+			for prio in High Auto Normal; do
+				log -d "Searching for paused downloads with priority $prio"
+				for hash in $(cat $TMP_AMULEDLLIST | grep "\- Paused \-" | grep "\- $prio" | awk '{print $1}'); do
+					for_wait_prio=""
+					case $prio in
+						High) for_wait_prio="Low Normal Auto" ;;
+						Auto) for_wait_prio="Low Normal" ;;
+						Normal) for_wait_prio="Low" ;;
+					esac
+					
+					found_low=0
+					
+					for wait_prio in $(echo $for_wait_prio); do
+						log -d "Searching for waiting downloads with priority $wait_prio"
+						for wait_hash in $(cat $TMP_AMULEDLLIST | grep "\- Waiting \-" | grep "\- $wait_prio" | awk '{print $1}'); do
+							if [ $(grep $wait_hash $TMP_AMULESCRIPT | wc -l) -eq 0 ]; then
+								log -d "Found lower priority waiting download"
+								echo "Pause $wait_hash" >> $TMP_AMULESCRIPT
+								echo "Resume $hash" >> $TMP_AMULESCRIPT
+								found_low=1
+								break
+							fi
+						done
+						if [ $found_low -eq 1 ]; then
+							break
+						fi
+					done
+					
+					if [ $found_low -eq 0 ]; then
+						break
+					fi
+				done
+				if [ $found_low -eq 0 ]; then
+					break
+				fi
+			done
+		fi
+
+		if [ $(cat $TMP_AMULESCRIPT | wc -l) -gt 0 ]; then
+			echo "exit" >> $TMP_AMULESCRIPT
+			log -d -n "Sending commands to amule... "
+			
+			
+			
+			cat $TMP_AMULESCRIPT | $AMULE_CMD -p $AMULE_PORT -P $AMULE_PASSWORD > $TMP_AMULEOUTPUT 2>&1 &
+			
+			cmd_res=0
+			for i in $(seq 1 $AUTODOWNLOAD_AMULECMD_WAITSTEP $AUTODOWNLOAD_AMULECMD_TIMEOUT); do
+				jobs > $TMP_JOBSOUTPUT
+				if [ $(grep -v Done $TMP_JOBSOUTPUT | grep -v Terminated | wc -l) -eq 0 ]; then	
+					cmd_res=1
+					break
+				fi
+				sleep $AUTODOWNLOAD_AMULECMD_WAITSTEP
+			done
+		
+			if [ $cmd_res -eq 0 ]; then
+				kill -9 %1 >/dev/null 2>&1
+				log "Failed! No response in $AUTODOWNLOAD_AMULECMD_TIMEOUT seconds"
+				
+				timeouts=1
+				if [ -e "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" ]; then
+					timeouts=$(expr $(cat "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER") + 1)
+				fi
+				
+				if [ $timeouts -gt $AUTODOWNLOAD_AMULECMD_TIMEOUT_RESTART ] ; then
+					log -d -n "$timeouts consecutive timeouts, trying to restart amule"
+					if ! $AMULE_DAEMON stop >> $TMP_LOGFILE 2>&1; then
+						log "Failed!"
+						echo -n $timeouts > "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER"
+						error "Couldn't stop amule"
+					else
+						log " "
+						restart_amule "Too many consecutive timeouts" 1
+						rm "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" > /dev/null 2>&1
+						error "Too many consecutive timeouts"
+					fi
+				else
+					echo -n $timeouts > "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER"
+				fi
+				
+				#error "Command timeout on amulecmd"
+				cleanup
+				exit 1
+			fi
+			
+		
+			if grep "EC connection failed" $TMP_AMULEOUTPUT > /dev/null 2>&1; then
+				log "Failed! EC connection failed."
+				log -d "Trying to restart amule..."
+				if ! $AMULE_DAEMON stop >> $TMP_LOGFILE 2>&1; then
+					log "Failed!"
+					error "Couldn't stop amule"
+				else
+					restart_amule "Couldn't connect to amuled" 1
+					error "Couldn't connect to amuled"
+				fi
+			fi
+		
+			log "Done."
+			
+			rm "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" > /dev/null 2>&1
+		else
+			log -d "Nothing to be done on amule"
+		fi
+		
+		if [ $available_slots -eq $MAX_CONCURRENT_DL ]; then
+			log -d -n "No more active amule downloads, stopping amule... "
+			if ! $AMULE_DAEMON stop >> $TMP_LOGFILE 2>&1; then
+				log "Failed!"
+				error "Couldn't stop amule" 
+			fi
+			echo "finished" > $AMULE_SHUTDOWN_REASON_FILE
+			log "Done."
+			echo "Amule stopped." | $MAIL_CMD -s "$PACKAGE Amule Stopped"
+		fi
+
+	fi
+
+}
+
+check_torrent() {
+	log -d -n "Checking running transmission-daemon processes... "
+	transmissionproc=$(ps -ef | grep transmission-daemon | grep -v grep | wc -l)
+
+	if [ $transmissionproc -eq 0 ]; then
+		log "No process running."
+	else 
+		log "Found $transmissionproc processes running"
+
+		if [ "$sleep_time" -gt 0 ]; then
+			log -d "Sleep time. All torrents will be stopped."
+			available_slots=0
+		fi
+		
+		log -d -n "Fetching download queue from transmission... "
+
+		if ! $TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --list | grep -v Sum: | tail -n +2  > $TMP_TRANSMISSION_OUTPUT 2>&1; then
+			log "Failed!"
+			error "Couldn't get transmission download list" 
+		fi
+		log "Done."
+		
+		log -d "Got the following output"
+		log "$(cat $TMP_TRANSMISSION_OUTPUT)"
+		
+		tor_finished=$(cat $TMP_TRANSMISSION_OUTPUT | grep " Finished " | grep " Done " | wc -l)
+		tor_idle=$(cat $TMP_TRANSMISSION_OUTPUT | grep " Idle " | wc -l)
+		tor_seeding=$(cat $TMP_TRANSMISSION_OUTPUT | grep " Seeding " | wc -l)
+		tor_stopped=$(cat $TMP_TRANSMISSION_OUTPUT | grep " Stopped " | wc -l)
+		tor_stopped_not_seeding=$(cat $TMP_TRANSMISSION_OUTPUT | grep " Stopped " | awk '{print$2}' | grep -v "100%" |  wc -l)
+		tor_downloading=$(expr $(cat $TMP_TRANSMISSION_OUTPUT | wc -l) - $tor_finished - $tor_idle - $tor_seeding - $tor_stopped)
+		
+		log -d "transmission status: finished $tor_finished, idle $tor_idle, seeding $tor_seeding, stopped $tor_stopped, stopped_not_seeding $tor_stopped_not_seeding, downloading $tor_downloading"
+		
+		available_slots=$(expr $available_slots - $tor_downloading - $tor_seeding - $tor_idle)
+		
+		log -d "available slots: $available_slots"
+		
+		if [ $tor_stopped_not_seeding -gt 0 ] && [ $tor_seeding -gt 0 ]; then
+			log -d "Some files are seedind while other are waiting. Trying to switch these by stopping the seeding ones..."
+			seeding_stopped=0
+			for torid in $(cat $TMP_TRANSMISSION_OUTPUT | grep " Seeding " | awk '{print $1}' | sed s/\*//); do 
+				log -d -n "Stopping torrent $torid... "
+				if ! $TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --torrent $torid --stop >> $TMP_LOGFILE 2>&1; then
+					log "Failed!";
+					error "Error while stopping seeding torrent" 
+				else
+					log "Done.";
+					available_slots=$(expr $available_slots + 1)
+					seeding_stopped=$(expr $seeding_stopped + 1)
+					if [ $seeding_stopped -ge $tor_stopped_not_seeding ]; then
+						break
+					fi
+				fi
+				
+			done
+		fi
+		
+		if [ $available_slots -lt 0 ]; then
+			log -d "Too many files in download. Trying to stop the idle ones... "
+			for torid in $(cat $TMP_TRANSMISSION_OUTPUT | grep " Idle " | awk '{print $1}' | sed s/\*//); do
+				log -d -n "Stopping torrent $torid... "
+				if ! $TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --torrent $torid --stop >> $TMP_LOGFILE 2>&1; then
+					log "Failed!";
+					error "Error while stopping idle torrent" 
+				else
+					log "Done.";
+					available_slots=$(expr $available_slots + 1)
+					if [ $available_slots -eq 0 ]; then
+						break
+					fi
+				fi
+			done
+		fi
+		
+		if [ $available_slots -lt 0 ]; then
+			log -d "Too many files in download. Trying to stop the seeding ones... "
+			for torid in $(cat $TMP_TRANSMISSION_OUTPUT | grep " Seeding " | awk '{print $1}' | sed s/\*//); do
+				log -d -n "Stopping torrent $torid... "
+				if ! $TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --torrent $torid --stop >> $TMP_LOGFILE 2>&1; then
+					log "Failed!";
+					error "Error while stopping seeding torrent" 
+				else
+					log "Done.";
+					available_slots=$(expr $available_slots + 1)
+					if [ $available_slots -eq 0 ]; then
+						break
+					fi
+				fi
+			done
+		fi
+
+		if [ $available_slots -lt 0 ]; then
+			log -d "Too many files in download. Trying to stop the downloading ones... "
+			for torid in $(cat $TMP_TRANSMISSION_OUTPUT | grep -v " Seeding " | grep -v " Idle " | grep -v " Stopped " | grep -v " Finished " | awk '{print $1}' | sed s/\*//); do
+				log -d -n "Stopping torrent $torid... "
+				if ! $TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --torrent $torid --stop >> $TMP_LOGFILE 2>&1; then
+					log "Failed!";
+					error "Error while stopping downloading torrent" 
+				else
+					log "Done.";
+					available_slots=$(expr $available_slots + 1)
+					if [ $available_slots -eq 0 ]; then
+						break
+					fi
+				fi
+			done
+		fi
+		
+		if [ $available_slots -gt 0 ]; then
+			log -d "Some slot are available. Trying to resume the stopped ones... "
+			for torid in $(cat $TMP_TRANSMISSION_OUTPUT | grep " Stopped " | awk '{print $1}' | sed s/\*//); do
+				log -d -n "Starting torrent $torid... "
+				if ! $TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --torrent $torid --start >> $TMP_LOGFILE 2>&1; then
+					log "Failed!";
+					error "Error while starting stopped torrent" 
+				else
+					log "Done.";
+					available_slots=$(expr $available_slots - 1)
+					if [ $available_slots -eq 0 ]; then
+						break
+					fi
+				fi
+			done
+		fi
+		
+	fi
+}
+
+
+
+sleep_time=0
+if [ -e $SLEEP_FILE ]; then
+	if [ $(cat $SLEEP_FILE) -gt $(expr $(date +"%s") - $SLEEP_MINS \* 60) ]; then 
+		log -d "Sleep time not terminated yet."
+		sleep_time=1
+	else
+		log -d "Sleep time terminated. Downloads will be resumed."
+		rm $SLEEP_FILE
+	fi
+fi
+
+if [ "$SLEEP_WHILE_COPYING" -gt 0 ]; then
+	if [ $(ps -ef | grep -w cp | grep -v -w grep | wc -l) -gt 0 ]; then
+		log -d "A file copy is in place. Going to sleep."
+		sleep_time=1
+		$SLEEP_CMD
+	fi
+fi
+
+
+if [ "$SLEEP_ON_LOW_MEM" -gt 0 ]; then
+	if [ `free | tail -n 2 | head -n 1 | cut -c 34-` -lt "$SLEEP_ON_LOW_MEM" ]; then
+		log -d "Free memory is less than $SLEEP_ON_LOW_MEM bytes. Going to sleep."
+		sleep_time=1
+		$SLEEP_CMD
+	fi
+fi
+
+if [ "$SLEEP_ON_HIGH_SWAP" -gt 0 ]; then
+	if [ `free | tail -n 1 | cut -c 23-29` -gt "$SLEEP_ON_HIGH_SWAP" ]; then
+		log -d "Used swap is greater than $SLEEP_ON_HIGH_SWAP bytes. Going to sleep."
+		sleep_time=1
+		$SLEEP_CMD
+	fi
+fi
+
+
+
+
+
+
+if [ "$sleep_time" -gt 0 ]; then
+	if ! $AUTODOWNLOAD_LOCK_CMD -l $$ $AUTODOWNLOAD_LOCKFILE; then
+		error "Error. Cannot acquire lock."
+	fi
+else
+	if ! $AUTODOWNLOAD_LOCK_CMD -w -l $$ $AUTODOWNLOAD_LOCKFILE; then
+		error "Error. Cannot acquire lock."
+	fi
+fi
+
+
+
+
+
+
+	
+available_slots=$MAX_CONCURRENT_DL
+
+if [ "$CLIENT_PREFERENCE" = "amule,torrent" ]; then
+	check_amule
+	if [ $CONCURRENT_AMULE_TORRENT -eq 0 ] && [ $available_slots -lt $MAX_CONCURRENT_DL ]; then
+		available_slots=0
+	fi
+	check_torrent
+elif [ "$CLIENT_PREFERENCE" = "torrent,amule" ]; then
+	check_torrent
+	if [ $CONCURRENT_AMULE_TORRENT -eq 0 ] && [ $available_slots -lt $MAX_CONCURRENT_DL ]; then
+		available_slots=0
+	fi
+	check_amule
+elif [ "$CLIENT_PREFERENCE" = "torrent" ]; then
+	check_torrent
+	old_available_slots=$available_slots
+	available_slots=0
+	check_amule
+	available_slots=$old_available_slots
+elif [ "$CLIENT_PREFERENCE" = "amule" ]; then
+	check_amule
+	old_available_slots=$available_slots
+	available_slots=0
+	check_torrent
+	available_slots=$old_available_slots
+else
+	old_available_slots=$available_slots
+	available_slots=0
+	check_amule
+	check_torrent
+	available_slots=$old_available_slots
+fi
+
+
+if [ "$UNSCHEDULE_ON_EMPTY_DL_EVENTS" -gt 0 ] && [ $available_slots -eq $MAX_CONCURRENT_DL ] && [ "$sleep_time" -eq 0 ]; then
+	do_unschedule=0
+	if [ "$UNSCHEDULE_ON_EMPTY_DL_EVENTS" -eq 1 ]; then
+		do_unschedule=1
+	else
+		if ! [ -e "$EMPTY_DL_COUNTER_FILE" ]; then
+			echo -n 1 > "$EMPTY_DL_COUNTER_FILE"
+		else
+			empty_dl_counter=$(expr $(cat "$EMPTY_DL_COUNTER_FILE") + 1)
+			if [ "$empty_dl_counter" -ge "$UNSCHEDULE_ON_EMPTY_DL_EVENTS" ]; then
+				do_unschedule=1
+			else
+				echo -n "$empty_dl_counter" > "$EMPTY_DL_COUNTER_FILE"
+			fi
+		fi
+	
+	fi
+
+	if [ "$do_unschedule" -gt 0 ]; then
+		log -d -n "No more active downloads, removing $PACKAGE from crontab... "
+		crontab -l | grep -v "$AUTODOWNLOAD_DLMONITOR_CMD" > $TMP_CRONTAB
+		crontab $TMP_CRONTAB
+		log "Done."
+		rm -rf "$AMULE_EMPTY_DL_COUNTER_FILE" 2>&1 >/dev/null
+	fi
+else
+	rm -rf "$AMULE_EMPTY_DL_COUNTER_FILE" 2>&1 >/dev/null
+fi
+
+cleanup
