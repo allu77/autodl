@@ -1,0 +1,19 @@
+#!/bin/sh
+. /etc/autodl/autodl.conf
+
+cmd=$0
+sleep_delta=$(expr $SLEEP_MINS \* 60);
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-s) shift; sleep_delta=$1 ;;
+		*)
+			echo "Unknown option $1" >&2
+			echo "Usage: $cmd [-s seconds]" >&2
+			exit 1
+			;;
+	esac
+	shift
+done
+
+echo $(expr $(date +"%s") - $SLEEP_MINS \* 60 + $sleep_delta) > $SLEEP_FILE

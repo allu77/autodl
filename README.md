@@ -52,3 +52,10 @@ the script when downloads are finished by editing the two following parameters i
 
 This script monitors aMule and Transmission and limits concurrent downloads to limits configured in 
 `/etc/autodl/autodl.conf`.
+
+## download-sleep ##
+
+`download-sleep [-s seconds]`
+
+Running this script will cause `monitor-download` to stop all active downloads for a sleep time (as configured
+in `/etc/autodl/autodl.conf`). You can change add further sleep time by specifing -s option.
