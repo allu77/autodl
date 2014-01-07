@@ -46,3 +46,9 @@ the script when downloads are finished by editing the two following parameters i
     "script-torrent-done-enabled": true, 
     "script-torrent-done-filename": "/path/to/autodl/bin/handle-finished-transmission", 
     
+## monitor-download ##
+
+`monitor-download`
+
+This script monitors aMule and Transmission and limits concurrent downloads to limits configured in 
+`/etc/autodl/autodl.conf`.
