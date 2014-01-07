@@ -1,0 +1,153 @@
+#!/bin/sh
+
+. /etc/autodl/autodl.conf
+PACKAGE="add-torrent-downloads"
+
+
+DATE=$(date +"%y%m%d%H%M%S")
+WATCH_FILE=$WATCH_PATH/$PACKAGE.$DATE.torrent_list
+TMP_TORRENTCACHE=/tmp/$PACKAGE.cache.$DATE
+TMP_TORRENTSCRIPT=/tmp/$PACKAGE.amulescript.$DATE
+TMP_CRONTAB=/tmp/$PACKAGE.crontab.$DATE
+TMP_LOGFILE=/tmp/$PACKAGE.logfile.$DATE
+
+LOGFILE=$AUTODOWNLOAD_LOG_PATH/$PACKAGE.log
+
+amuled_was_running=0
+links_added=0
+
+cleanup() {
+
+	echo -n "----------------- " >> "$LOGFILE"
+	date >> "$LOGFILE"
+	cat $TMP_LOGFILE >> "$LOGFILE"
+
+	rm -f $TMP_ED2KACHE
+	rm -f $TMP_TORRENTSCRIPT
+	rm -f $TMP_CRONTAB
+	rm -f $TMP_LOGFILE
+	
+	$AUTODOWNLOAD_LOCK_CMD -u $AUTODOWNLOAD_LOCKFILE
+	if [ $amuled_was_running -eq 0 ] && [ $links_added -eq 0 ]; then
+		$AUTODOWNLOAD_PATH/$AUTODOWNLOAD_DLMONITOR_CMD
+	fi
+}
+
+log() {
+	echo $@
+	echo $@ >> $TMP_LOGFILE
+}
+
+error() {
+	log "$PACKAGE Error: $1"
+	echo "
+	
+	$PACKAGE Error: $1
+	
+	$(cat $TMP_LOGFILE)
+	
+	"| $MAIL_CMD -s "$PACKAGE ERROR"
+
+	cleanup
+	exit 1
+}
+
+
+if ! $AUTODOWNLOAD_LOCK_CMD -w -l $$ $AUTODOWNLOAD_LOCKFILE; then
+	error "Error. Cannot acquire lock."
+fi
+
+
+# - Fetch link torrent
+
+[ -d "$WATCH_PATH" ] || mkdir "$WATCH_PATH" 2>&1 > /dev/null || error "Cannot create directory $WATCH_PATH"
+
+log -n "Running command $GET_TORRENT_CMD ... "
+if ! $GET_TORRENT_CMD 1> $WATCH_FILE 2>> "$TMP_LOGFILE"; then
+	log "Failed!";
+	error "Cannot get new links"
+fi
+log " Done."
+
+# - Add link ed2k (con invio mail)
+
+touch $AUTODOWNLOAD_TORRENT_CACHE_FILE
+touch $TMP_TORRENTSCRIPT
+
+log -n "Creating backup copy of cache file... "
+cp "$AUTODOWNLOAD_TORRENT_CACHE_FILE" "$AUTODOWNLOAD_TORRENT_CACHE_FILE.old" 2>&1 > /dev/null || ( log "Failed!" ; error "Cannot backup cache file")
+log "Done"
+
+for linkfile in $(ls $WATCH_PATH/*.torrent_list); do
+	log "Found file $linkfile"
+	fromdos "$linkfile"
+	for link in $(cat $linkfile | grep http://); do
+		md5link=$(echo $link | md5sum)
+		oldlink=$(grep "$md5link" $AUTODOWNLOAD_TORRENT_CACHE_FILE|wc -l)
+		if [ $oldlink -eq 0 ]; then
+			log -n "Found new link $link, adding to torrent script... "
+			echo "$link" >> $TMP_TORRENTSCRIPT
+			log "Done."
+			echo "$md5link $link" >> $AUTODOWNLOAD_TORRENT_CACHE_FILE
+		fi
+	done
+	rm $linkfile
+done
+
+tail -n $AUTODOWNLOAD_TORRENT_CACHE_MAX $AUTODOWNLOAD_TORRENT_CACHE_FILE > $TMP_TORRENTCACHE
+mv $TMP_TORRENTCACHE $AUTODOWNLOAD_TORRENT_CACHE_FILE
+
+log "Done."
+
+script_lines=$(cat $TMP_TORRENTSCRIPT|wc -l)
+
+if [  $script_lines -gt 0 ]; then
+	log -n "Checking if trasmission is running... "
+	if ! $TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --list > /dev/null 2>&1; then
+		log "Failed!"
+		error "Transmission is not running"
+	fi
+	echo "Done."
+
+
+	# Lanciare comandi
+
+	ok_link=""
+	ko_link=""
+	
+	for link in $(cat "$TMP_TORRENTSCRIPT"); do
+
+		log -n "Adding link $link... "
+		if ! $TRANSMISSION_CMD --auth=$TRANSMISSION_USER:$TRANSMISSION_PASSWORD --add "$link" > /dev/null 2>&1; then
+			log "Failed!"
+			ko_link=$ko_link`echo "\n$link"`
+		else
+			echo "Done."
+			ok_link=$ok_link`echo "\n$link"`
+		fi
+	done
+
+	if [ `echo -n "$ok_link" | wc -l` -gt 0 ]; then
+		echo "The Following links were succcesfully added to torrent queue:$ok_link" | $MAIL_CMD -s "$PACKAGE: Links added"
+	fi
+
+	if [ `echo -n "$ko_link" | wc -l` -gt 0 ]; then
+		error "Errors found while adding links..."
+	fi
+
+fi
+
+# -Schedulazione controller
+is_mon_scheduled=$(crontab -l | grep $AUTODOWNLOAD_DLMONITOR_CMD | grep -v grep | wc -l)
+if [ $is_mon_scheduled -eq 0 ] ; then
+	log -n "monitor-download is not in crontab, adding it... "
+	crontab -l > $TMP_CRONTAB
+	echo "$CRONTAB_DLMONITOR" >> $TMP_CRONTAB
+	crontab $TMP_CRONTAB
+	log "Done.";
+else
+	log "monitor-download already in crontab."
+fi
+
+
+cleanup

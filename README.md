@@ -59,3 +59,10 @@ This script monitors aMule and Transmission and limits concurrent downloads to l
 
 Running this script will cause `monitor-download` to stop all active downloads for a sleep time (as configured
 in `/etc/autodl/autodl.conf`). You can change add further sleep time by specifing -s option.
+
+## add-amule-downloads and add-torrent-downloads ##
+`add-amule-downloads`
+`add-torrent-downloads`
+
+This two script execute a configured command to get new amule or torrent links. If a new link is found,
+it is added to aMule or Trasmission download queue. `monitor-download` is then added to crontab.
