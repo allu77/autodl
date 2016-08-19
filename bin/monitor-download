@@ -573,13 +573,13 @@ check_torrent() {
 
 
 sleep_time=0
-if [ -e $SLEEP_FILE ]; then
-	if [ $(cat $SLEEP_FILE) -gt $(expr $(date +"%s") - $SLEEP_MINS \* 60) ]; then 
+if [ -e "$SLEEP_FILE" ]; then
+	if [ $(cat "$SLEEP_FILE") -gt $(expr $(date +"%s") - $SLEEP_MINS \* 60) ]; then 
 		log -d "Sleep time not terminated yet."
 		sleep_time=1
 	else
 		log -d "Sleep time terminated. Downloads will be resumed."
-		rm $SLEEP_FILE
+		rm "$SLEEP_FILE"
 	fi
 fi
 
