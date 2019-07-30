@@ -60,13 +60,19 @@ restart_amule() {
 		log "Done."
 		log -d -n "Waining some seconds for amule to complete boot... "
 		sleep 30
-		log "Done."
-		rm $AMULE_SHUTDOWN_REASON_FILE >/dev/null 2>&1
-		if [ "$send_email" -gt 0 ]; then
-			echo "
-			Amule was restarted due to $restart_reason
-			$(cat $TMP_LOGFILE)
-			"| $MAIL_CMD -s "$PACKAGE Warning"
+		amuledproc=$(ps -ef | grep amuled | grep -v grep | wc -l)
+		if [ $amuledproc -eq 0 ]; then
+			log "Failed!"
+			return 1
+		else
+			log "Done."
+			rm $AMULE_SHUTDOWN_REASON_FILE >/dev/null 2>&1
+			if [ "$send_email" -gt 0 ]; then
+				echo "
+				Amule was restarted due to $restart_reason
+				$(cat $TMP_LOGFILE)
+				"| $MAIL_CMD -s "$PACKAGE Warning"
+			fi
 		fi
 	fi
 	return 0
@@ -109,13 +115,14 @@ check_amule() {
 		else
 			restart_reason=""
 			
-			if ! [ -e $AMULE_SHUTDOWN_REASON_FILE ]; then
+			if ! [ -e "$AMULE_SHUTDOWN_REASON_FILE" ]; then
 				log "Due to unclean shutdown, restarting."
-				restart_amule "unclean_shutdown" 1
+				restart_amule "unclean_shutdown" 1 || error "Couldn't restart aMule"
 			else
 				restart_reason=$(cat "$AMULE_SHUTDOWN_REASON_FILE")
+				log "Because aMule was $restart_reason."
 				if ! [ "$restart_reason" == "finished" ]; then
-					restart_amule "$restart_reason" 1
+					restart_amule "$restart_reason" 1 || error "Couldn't restart aMule"
 				fi
 			fi
 		fi
@@ -154,7 +161,7 @@ check_amule() {
 					error "Couldn't stop amule"
 				else
 					log " "
-					restart_amule "Too many consecutive timeouts" 1
+					restart_amule "Too many consecutive timeouts" 1 || error "Couldn't restart aMule"
 					rm "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" > /dev/null 2>&1
 					error "Too many consecutive timeouts"
 				fi
@@ -188,7 +195,7 @@ check_amule() {
 					error "Couldn't stop amule"
 				else
 					log " "
-					restart_amule "Too many consecutive timeouts" 1
+					restart_amule "Too many consecutive timeouts" 1 || error "Couldn't restart aMule"
 					rm "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" > /dev/null 2>&1
 					error "Too many consecutive timeouts"
 				fi
@@ -393,7 +400,7 @@ check_amule() {
 						error "Couldn't stop amule"
 					else
 						log " "
-						restart_amule "Too many consecutive timeouts" 1
+						restart_amule "Too many consecutive timeouts" 1 || error "Couldn't restart aMule"
 						rm "$AUTODOWNLOAD_AMULECMD_TIMEOUT_COUNTER" > /dev/null 2>&1
 						error "Too many consecutive timeouts"
 					fi
@@ -414,7 +421,7 @@ check_amule() {
 					log "Failed!"
 					error "Couldn't stop amule"
 				else
-					restart_amule "Couldn't connect to amuled" 1
+					restart_amule "Couldn't connect to amuled" 1 || error "Couldn't restart aMule"
 					error "Couldn't connect to amuled"
 				fi
 			fi
@@ -593,7 +600,16 @@ fi
 
 
 if [ "$SLEEP_ON_LOW_MEM" -gt 0 ]; then
-	if [ `free | tail -n 2 | head -n 1 | cut -c 34-` -lt "$SLEEP_ON_LOW_MEM" ]; then
+
+	free_mem=0
+	if free | head -n 1 | grep available > /dev/null ; then 
+		free_mem=$(free | head -n 2 | tail -n 1 | cut -c 69-)
+	else 
+		free_mem=$(free | tail -n 2 | head -n 1 | cut -c 34-)
+	fi
+
+
+	if [ "$free_mem" -lt "$SLEEP_ON_LOW_MEM" ]; then
 		log -d "Free memory is less than $SLEEP_ON_LOW_MEM bytes. Going to sleep."
 		sleep_time=1
 		$SLEEP_CMD
@@ -686,6 +702,7 @@ if [ "$UNSCHEDULE_ON_EMPTY_DL_EVENTS" -gt 0 ] && [ $available_slots -eq $MAX_CON
 		log -d -n "No more active downloads, removing $PACKAGE from crontab... "
 		crontab -l | grep -v "$AUTODOWNLOAD_DLMONITOR_CMD" > $TMP_CRONTAB
 		crontab $TMP_CRONTAB
+		echo "finished" > $AMULE_SHUTDOWN_REASON_FILE
 		log "Done."
 		rm -rf "$AMULE_EMPTY_DL_COUNTER_FILE" 2>&1 >/dev/null
 	fi
