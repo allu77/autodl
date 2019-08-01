@@ -52,7 +52,10 @@ error() {
 restart_amule() {
 	restart_reason=$1
 	send_email=$2
-	log -d -n "Restarting amule (reason $restart_reason)... "
+	log -d "Restarting amule (reason $restart_reason)... "
+	log -d "First executing stop as a precaution... "
+	$AMULE_DAEMON stop >> $TMP_LOGFILE 2>&1
+	log -d -n "Now starting amule-daemon... "
 	if ! $AMULE_DAEMON start >> $TMP_LOGFILE 2>&1; then
 		log "Failed!"
 		error "Couldn't restart amule ($restart_reason)"
