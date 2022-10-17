@@ -81,7 +81,7 @@ log "Done"
 for linkfile in $(ls $WATCH_PATH/*.torrent_list); do
 	log "Found file $linkfile"
 	fromdos "$linkfile"
-	for link in $(cat $linkfile | grep http://); do
+	for link in $(cat $linkfile); do
 		md5link=$(echo $link | md5sum)
 		oldlink=$(grep "$md5link" $AUTODOWNLOAD_TORRENT_CACHE_FILE|wc -l)
 		if [ $oldlink -eq 0 ]; then
