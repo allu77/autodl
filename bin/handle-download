@@ -104,9 +104,14 @@ parse_dl_file() {
 	local send_mail=1
 	local go_on=1
 
-	local newname=$(echo "$dlname" | $PHP_CMD $REGEXPTOOL_SCRIPT -c $REGEXPTOOL_CONFIG_RENAME)
-	local copypath=$(echo "$newname" | $PHP_CMD $REGEXPTOOL_SCRIPT -c $REGEXPTOOL_CONFIG_COPY)
-	local movepath=$(echo "$newname" | $PHP_CMD $REGEXPTOOL_SCRIPT -c $REGEXPTOOL_CONFIG_MOVE)
+	local newname="$dlname"
+	local copypath=""
+	local movepath=""
+
+	[ -z "$AUTODOWNLOAD_RENAME_CMD" ] || newname=$(echo "$dlname" | $AUTODOWNLOAD_RENAME_CMD)
+	[ -z "$AUTODOWNLOAD_COPY_CMD" ] || copypath=$(echo "$newname" | $AUTODOWNLOAD_COPY_CMD)
+	[ -z "$AUTODOWNLOAD_MOVE_CMD" ] || movepath=$(echo "$newname" | $AUTODOWNLOAD_MOVE_CMD)
+
 	local newfile="$dlpath/$newname"
 
 	local actions="$dlname will be:"
